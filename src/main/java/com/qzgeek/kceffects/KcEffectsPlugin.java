@@ -146,28 +146,55 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
             updateBossBars(player);
             // 生机：每 2 秒恢复 0.5 生命
             if (effectManager.has(player, KcEffect.VITALITY) && tickCounter % 2 == 0) {
-                double h = player.getHealth();
-                if (h < player.getMaxHealth()) {
-                    player.setHealth(Math.min(player.getMaxHealth(), h + 0.5));
-                }
+                scheduleEntity(player, p -> {
+                    double h = p.getHealth();
+                    if (h < p.getMaxHealth()) {
+                        p.setHealth(Math.min(p.getMaxHealth(), h + 0.5));
+                    }
+                });
             }
             // 饱腹代偿：每 5 秒恢复 0.5 饥饿 + 0.5 饱和度
             if (effectManager.has(player, KcEffect.SATIETY) && tickCounter % 5 == 0) {
-                player.setFoodLevel(Math.min(20, player.getFoodLevel() + 1));
-                player.setSaturation(Math.min(20, player.getSaturation() + 0.5f));
+                scheduleEntity(player, p -> {
+                    p.setFoodLevel(Math.min(20, p.getFoodLevel() + 1));
+                    p.setSaturation(Math.min(20, p.getSaturation() + 0.5f));
+                });
             }
-            // 活力：奔跑时不消耗饥饿值（重置体力消耗积累）
-            if (effectManager.has(player, KcEffect.VIGOR) && player.isSprinting()) {
-                player.setExhaustion(0f);
+            // 活力：奔跑时不消耗饥饿值（每 5 tick 重置体力消耗积累）
+            if (effectManager.has(player, KcEffect.VIGOR) && player.isSprinting() && tickCounter % 5 == 0) {
+                scheduleEntity(player, p -> p.setExhaustion(0f));
             }
-            // 寒带疾行：脚下是雪/冰/细雪则加速
-            if (effectManager.has(player, KcEffect.COLD_STRIDE)) {
-                Block below = player.getLocation().add(0, -0.5, 0).getBlock();
-                if (isColdBlock(below.getType())) {
-                    player.setWalkSpeed(Math.min(0.3f, 0.2f * 1.4f));
-                } else {
-                    player.setWalkSpeed(0.2f);
+            // 寒带疾行：脚下是雪/冰/细雪则加速（每 2 秒更新，效果结束恢复 0.2）
+            if (tickCounter % 2 == 0) {
+                boolean hasColdStride = effectManager.has(player, KcEffect.COLD_STRIDE);
+                scheduleEntity(player, p -> {
+                    if (hasColdStride) {
+                        Block below = p.getLocation().add(0, -0.5, 0).getBlock();
+                        p.setWalkSpeed(isColdBlock(below.getType()) ? 0.28f : 0.2f);
+                    } else {
+                        p.setWalkSpeed(0.2f);
+                    }
+                });
+            }
+        }
+    }
+
+    /**
+     * Folia 兼容：实体操作必须在实体所属区域线程执行。
+     * 使用 EntityScheduler 调度到正确线程；非 Folia 环境直接执行。
+     */
+    private void scheduleEntity(Player player, java.util.function.Consumer<Player> action) {
+        if (player == null || !player.isOnline()) return;
+        try {
+            player.getScheduler().run(this, task -> {
+                if (player.isOnline()) {
+                    action.accept(player);
                 }
+            }, null);
+        } catch (Throwable ignored) {
+            try {
+                action.accept(player);
+            } catch (Throwable ignored2) {
             }
         }
     }
