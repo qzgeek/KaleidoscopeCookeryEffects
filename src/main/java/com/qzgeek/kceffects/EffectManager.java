@@ -1,0 +1,74 @@
+package com.qzgeek.kceffects;
+
+import org.bukkit.entity.Player;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 效果状态管理：跟踪玩家当前生效的自定义效果及剩余时间
+ * 记录总时长用于 BossBar 进度显示
+ */
+public class EffectManager {
+    public static class ActiveEffect {
+        public final long expiry;      // 到期时间戳（ms）
+        public final long totalTicks;  // 总时长（tick）
+        public final int level;        // 等级（0 = I 级）
+
+        public ActiveEffect(long expiry, long totalTicks, int level) {
+            this.expiry = expiry;
+            this.totalTicks = totalTicks;
+            this.level = level;
+        }
+    }
+
+    /** player UUID -> (effect -> 效果状态) */
+    private final Map<UUID, Map<KcEffect, ActiveEffect>> activeEffects = new ConcurrentHashMap<>();
+
+    public void apply(Player player, KcEffect effect, int durationTicks, int level) {
+        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentHashMap<>());
+        long newExpiry = System.currentTimeMillis() + durationTicks * 50L;
+        ActiveEffect existing = map.get(effect);
+        // 叠加时长（同类效果刷新时延长）
+        if (existing != null && existing.expiry > System.currentTimeMillis()) {
+            newExpiry = existing.expiry + durationTicks * 50L;
+        }
+        map.put(effect, new ActiveEffect(newExpiry, durationTicks, level));
+    }
+
+    public boolean has(Player player, KcEffect effect) {
+        Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
+        if (map == null) return false;
+        ActiveEffect ae = map.get(effect);
+        if (ae == null) return false;
+        if (ae.expiry <= System.currentTimeMillis()) {
+            map.remove(effect);
+            if (map.isEmpty()) activeEffects.remove(player.getUniqueId());
+            return false;
+        }
+        return true;
+    }
+
+    /** 获取所有未过期的效果 */
+    public Map<KcEffect, ActiveEffect> getActive(Player player) {
+        Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
+        if (map == null) return Map.of();
+        long now = System.currentTimeMillis();
+        map.entrySet().removeIf(e -> e.getValue().expiry <= now);
+        if (map.isEmpty()) activeEffects.remove(player.getUniqueId());
+        return map;
+    }
+
+    public void remove(Player player) {
+        activeEffects.remove(player.getUniqueId());
+    }
+
+    public void cleanup() {
+        long now = System.currentTimeMillis();
+        activeEffects.entrySet().removeIf(e -> {
+            e.getValue().entrySet().removeIf(ee -> ee.getValue().expiry <= now);
+            return e.getValue().isEmpty();
+        });
+    }
+}
