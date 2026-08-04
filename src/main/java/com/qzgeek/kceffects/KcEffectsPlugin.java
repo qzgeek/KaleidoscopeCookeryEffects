@@ -6,6 +6,7 @@ import net.momirealms.craftengine.core.item.ItemManager;
 import net.momirealms.craftengine.core.plugin.CraftEngine;
 import net.momirealms.craftengine.core.util.Key;
 import org.bukkit.Bukkit;
+import java.io.File;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
@@ -209,7 +210,7 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
             String remain = formatDuration(remainSec * 20);
             String level = ae.level > 0 ? " " + toRoman(ae.level + 1) : "";
             boolean neg = kc == KcEffect.BLOATING;
-            bar.setTitle("§" + (neg ? "c" : "a") + "✦ " + kc.displayName() + level + " §7" + remain);
+            bar.setTitle("§" + (neg ? "c" : "a") + "✦ " + kc.displayName() + level + " ✦ §7" + remain);
         }
 
         // 移除已过期的 BossBar
@@ -239,6 +240,8 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
     @EventHandler
     public void onQuit(org.bukkit.event.player.PlayerQuitEvent event) {
         UUID uid = event.getPlayer().getUniqueId();
+        // 保存效果到磁盘
+        saveEffects(event.getPlayer());
         Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
         if (bars != null) {
             for (org.bukkit.boss.BossBar bar : bars.values()) {
@@ -246,6 +249,65 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
             }
         }
         effectManager.remove(event.getPlayer());
+    }
+
+    @EventHandler
+    public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) {
+        // 恢复上次下线的效果
+        java.util.Map<String, Long> saved = loadEffects(event.getPlayer().getUniqueId());
+        if (saved != null && !saved.isEmpty()) {
+            effectManager.restore(event.getPlayer(), saved);
+            deleteEffects(event.getPlayer().getUniqueId());
+        }
+    }
+
+    // ===== 效果持久化（下线暂存，上线恢复）=====
+    private File getDataFile(UUID uuid) {
+        File dir = new File(getDataFolder(), "effects");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, uuid + ".yml");
+    }
+
+    private void saveEffects(Player player) {
+        try {
+            java.util.Map<String, Long> snap = effectManager.snapshot(player);
+            if (snap.isEmpty()) {
+                deleteEffects(player.getUniqueId());
+                return;
+            }
+            File f = getDataFile(player.getUniqueId());
+            StringBuilder sb = new StringBuilder();
+            sb.append("# 下线暂存效果\n");
+            for (java.util.Map.Entry<String, Long> e : snap.entrySet()) {
+                sb.append(e.getKey()).append(": ").append(e.getValue()).append('\n');
+            }
+            java.nio.file.Files.write(f.toPath(), sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+        }
+    }
+
+    private java.util.Map<String, Long> loadEffects(UUID uuid) {
+        File f = getDataFile(uuid);
+        if (!f.exists()) return null;
+        try {
+            java.util.Map<String, Long> data = new java.util.LinkedHashMap<>();
+            for (String line : java.nio.file.Files.readAllLines(f.toPath(), java.nio.charset.StandardCharsets.UTF_8)) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                String[] parts = trimmed.split(":", 2);
+                if (parts.length == 2) {
+                    data.put(parts[0].trim(), Long.parseLong(parts[1].trim()));
+                }
+            }
+            return data;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void deleteEffects(UUID uuid) {
+        File f = getDataFile(uuid);
+        if (f.exists()) f.delete();
     }
 
     // ===== 保鲜：食用坏食物无负面 =====

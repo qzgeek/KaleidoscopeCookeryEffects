@@ -71,4 +71,36 @@ public class EffectManager {
             return e.getValue().isEmpty();
         });
     }
+
+    // ===== 持久化 =====
+
+    /** 获取某玩家的可持久化效果数据（effect名 -> 剩余tick） */
+    public java.util.Map<String, Long> snapshot(Player player) {
+        java.util.Map<String, Long> snap = new java.util.LinkedHashMap<>();
+        Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
+        if (map == null) return snap;
+        long now = System.currentTimeMillis();
+        for (Map.Entry<KcEffect, ActiveEffect> entry : map.entrySet()) {
+            long remainMs = entry.getValue().expiry - now;
+            if (remainMs > 0) {
+                snap.put(entry.getKey().name(), remainMs / 50L);
+            }
+        }
+        return snap;
+    }
+
+    /** 从持久化数据恢复效果 */
+    public void restore(Player player, java.util.Map<String, Long> data) {
+        if (data == null || data.isEmpty()) return;
+        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentHashMap<>());
+        for (Map.Entry<String, Long> entry : data.entrySet()) {
+            try {
+                KcEffect kc = KcEffect.valueOf(entry.getKey());
+                long remainTicks = entry.getValue();
+                if (remainTicks <= 0) continue;
+                map.put(kc, new ActiveEffect(System.currentTimeMillis() + remainTicks * 50L, remainTicks, 0));
+            } catch (Exception ignored) {
+            }
+        }
+    }
 }
