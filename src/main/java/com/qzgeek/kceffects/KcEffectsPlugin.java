@@ -473,14 +473,15 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ===== 胀气：每次按下潜行键获得一次向上的弹射速度 =====
+    // ===== 胀气：每次按下潜行键获得一次向上的弹射速度（约升高 2 格）=====
     @EventHandler(priority = EventPriority.HIGH)
     public void onSneak(org.bukkit.event.player.PlayerToggleSneakEvent event) {
         if (!event.isSneaking()) return;
         Player player = event.getPlayer();
         if (!effectManager.has(player, KcEffect.BLOATING)) return;
         scheduleEntity(player, p -> {
-            p.setVelocity(p.getVelocity().add(new org.bukkit.util.Vector(0, 0.9, 0)));
+            // 0.56 垂直速度 ≈ 升高 2 格（MC 跳跃物理 h = v²/(2×0.08)）
+            p.setVelocity(p.getVelocity().add(new org.bukkit.util.Vector(0, 0.56, 0)));
             p.getWorld().playSound(p.getLocation(), org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
         });
     }

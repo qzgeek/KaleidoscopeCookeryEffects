@@ -1,5 +1,5 @@
 name: KcEffects
-version: 1.0.3
+version: 1.0.4
 main: com.qzgeek.kceffects.KcEffectsPlugin
 api-version: '1.21'
 folia-supported: true
