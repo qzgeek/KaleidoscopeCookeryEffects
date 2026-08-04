@@ -297,6 +297,21 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
     }
 
     @EventHandler
+    public void onDeath(org.bukkit.event.entity.PlayerDeathEvent event) {
+        // 与原版药水一致：死亡后清除所有效果
+        Player player = event.getEntity();
+        UUID uid = player.getUniqueId();
+        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
+        if (bars != null) {
+            for (org.bukkit.boss.BossBar bar : bars.values()) {
+                bar.removeAll();
+            }
+        }
+        effectManager.remove(player);
+        bloatingTriggered.remove(uid);
+    }
+
+    @EventHandler
     public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) {
         // 恢复上次下线的效果
         java.util.Map<String, Long> saved = loadEffects(event.getPlayer().getUniqueId());
@@ -473,17 +488,29 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ===== 胀气：每次按下潜行键获得一次向上的弹射速度（约升高 2 格）=====
+    // ===== 胀气：点击一次潜行给予一次垂直加速（约升高 2 格）=====
+    // 一次潜行会话仅触发一次；保持潜行不触发；允许空中触发；无冷却。
+    // 用会话标记防止"服务器弹射强制取消潜行→客户端重按"导致的循环触发。
+    private final Map<UUID, Boolean> bloatingTriggered = new java.util.concurrent.ConcurrentHashMap<>();
+
     @EventHandler(priority = EventPriority.HIGH)
     public void onSneak(org.bukkit.event.player.PlayerToggleSneakEvent event) {
-        if (!event.isSneaking()) return;
         Player player = event.getPlayer();
-        if (!effectManager.has(player, KcEffect.BLOATING)) return;
-        scheduleEntity(player, p -> {
-            // 0.56 垂直速度 ≈ 升高 2 格（MC 跳跃物理 h = v²/(2×0.08)）
-            p.setVelocity(p.getVelocity().add(new org.bukkit.util.Vector(0, 0.56, 0)));
-            p.getWorld().playSound(p.getLocation(), org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
-        });
+        if (event.isSneaking()) {
+            if (!effectManager.has(player, KcEffect.BLOATING)) return;
+            // 本次潜行会话已触发过则跳过（防止服务器取消潜行后客户端重按导致的循环）
+            if (Boolean.TRUE.equals(bloatingTriggered.get(player.getUniqueId()))) return;
+            bloatingTriggered.put(player.getUniqueId(), true);
+            scheduleEntity(player, p -> {
+                // 直接设置垂直速度（保留水平速度），不累加避免叠加
+                org.bukkit.util.Vector v = p.getVelocity();
+                p.setVelocity(new org.bukkit.util.Vector(v.getX(), 0.56, v.getZ()));
+                p.getWorld().playSound(p.getLocation(), org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
+            });
+        } else {
+            // 玩家主动松开潜行 → 重置，下次点击可再次触发
+            bloatingTriggered.remove(player.getUniqueId());
+        }
     }
 
     // ===== 即时熔炼：挖矿掉落熔炼产物 =====

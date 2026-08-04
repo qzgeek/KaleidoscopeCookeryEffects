@@ -28,12 +28,8 @@ public class EffectManager {
 
     public void apply(Player player, KcEffect effect, int durationTicks, int level) {
         Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentHashMap<>());
+        // 与原版药水一致：同类效果直接覆盖（重置时长），不叠加
         long newExpiry = System.currentTimeMillis() + durationTicks * 50L;
-        ActiveEffect existing = map.get(effect);
-        // 叠加时长（同类效果刷新时延长）
-        if (existing != null && existing.expiry > System.currentTimeMillis()) {
-            newExpiry = existing.expiry + durationTicks * 50L;
-        }
         map.put(effect, new ActiveEffect(newExpiry, durationTicks, level));
     }
 
