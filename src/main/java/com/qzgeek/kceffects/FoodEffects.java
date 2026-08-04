@@ -118,7 +118,7 @@ public final class FoodEffects {
         map("oolong", "VANILLA:minecraft:slow_falling:7200|VANILLA:minecraft:jump_boost:7200"); // 乌龙茶 6min 缓降+跳跃
         map("tieguanyin", "INSTANT_SMELT:2400");             // 铁观音 2min 即时熔炼
         map("biluochun", "PROJECTILE_DODGE:2400");           // 碧螺春 2min 弹射闪避
-        map("sakura_fubuki", "WARMTH:3600");                 // 樱花吹雪 3min 温暖
+        map("sakura_fubuki", "HASTEN:7200");                // 樱吹雪 6min 迟滞
     }
 
     private static void map(String id, String effects) {

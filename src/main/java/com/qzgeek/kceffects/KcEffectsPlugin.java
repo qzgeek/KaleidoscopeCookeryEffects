@@ -144,27 +144,11 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         for (Player player : Bukkit.getOnlinePlayers()) {
             // 更新自定义效果的 BossBar 展示
             updateBossBars(player);
-            // 生机：每 2 秒恢复 0.5 生命
-            if (effectManager.has(player, KcEffect.VITALITY) && tickCounter % 2 == 0) {
-                scheduleEntity(player, p -> {
-                    double h = p.getHealth();
-                    if (h < p.getMaxHealth()) {
-                        p.setHealth(Math.min(p.getMaxHealth(), h + 0.5));
-                    }
-                });
-            }
-            // 饱腹代偿：每 5 秒恢复 0.5 饥饿 + 0.5 饱和度
-            if (effectManager.has(player, KcEffect.SATIETY) && tickCounter % 5 == 0) {
-                scheduleEntity(player, p -> {
-                    p.setFoodLevel(Math.min(20, p.getFoodLevel() + 1));
-                    p.setSaturation(Math.min(20, p.getSaturation() + 0.5f));
-                });
-            }
-            // 活力：奔跑时不消耗饥饿值（每 5 tick 重置体力消耗积累）
+            // 活力：奔跑时将疲劳值重置为 0（每 5 tick）
             if (effectManager.has(player, KcEffect.VIGOR) && player.isSprinting() && tickCounter % 5 == 0) {
                 scheduleEntity(player, p -> p.setExhaustion(0f));
             }
-            // 寒带疾行：脚下是雪/冰/细雪则加速（每 2 秒更新，效果结束恢复 0.2）
+            // 寒带疾行：雪/冰/细雪上加速（每 2 秒更新，效果结束恢复 0.2）
             if (tickCounter % 2 == 0) {
                 boolean hasColdStride = effectManager.has(player, KcEffect.COLD_STRIDE);
                 scheduleEntity(player, p -> {
@@ -176,7 +160,41 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
                     }
                 });
             }
+            // 温暖：热源附近每秒恢复 1 点生命；下界 25% 概率恢复 0.5
+            if (effectManager.has(player, KcEffect.WARMTH) && tickCounter % 2 == 0) {
+                scheduleEntity(player, p -> {
+                    if (p.getHealth() >= p.getMaxHealth()) return;
+                    boolean inNether = p.getWorld().getEnvironment() == org.bukkit.World.Environment.NETHER;
+                    if (inNether) {
+                        if (Math.random() < 0.25) {
+                            p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 0.5));
+                        }
+                    } else if (hasHeatSourceNearby(p)) {
+                        p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 1.0));
+                    }
+                });
+            }
         }
+    }
+
+    /** 检查周围 5×5×3 范围内是否有热源 */
+    private boolean hasHeatSourceNearby(Player player) {
+        Location loc = player.getLocation();
+        int bx = loc.getBlockX(), by = loc.getBlockY(), bz = loc.getBlockZ();
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    Block b = player.getWorld().getBlockAt(bx + dx, by + dy, bz + dz);
+                    Material m = b.getType();
+                    if (m == Material.CAMPFIRE || m == Material.SOUL_CAMPFIRE
+                            || m == Material.FIRE || m == Material.SOUL_FIRE
+                            || m == Material.LAVA || m == Material.MAGMA_BLOCK) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -366,27 +384,105 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ===== 温暖：免疫冰冻伤害 =====
-    @EventHandler(priority = EventPriority.HIGHEST)
+    // ===== 饱腹代偿：受伤害时降低伤害，消耗饱和度和饥饿值 =====
+    @EventHandler(priority = EventPriority.HIGH)
     public void onDamage(EntityDamageEvent event) {
-        if (event.getEntity() instanceof Player player
-                && effectManager.has(player, KcEffect.WARMTH)
-                && (event.getCause() == EntityDamageEvent.DamageCause.FREEZE
-                    || event.getCause() == EntityDamageEvent.DamageCause.SUFFOCATION
-                    || event.getCause() == EntityDamageEvent.DamageCause.FIRE_TICK
-                    || event.getCause() == EntityDamageEvent.DamageCause.FIRE)) {
-            event.setCancelled(true);
-        }
+        if (!(event.getEntity() instanceof Player player)) return;
+        if (!effectManager.has(player, KcEffect.SATIETY)) return;
+        if (event.isCancelled()) return;
+        // 弱点伤害：爆炸/闪电/凋零/音波/间接魔法/窒息/冻结 → 双倍疲劳消耗
+        EntityDamageEvent.DamageCause cause = event.getCause();
+        boolean weak = cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION
+                || cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION
+                || cause == EntityDamageEvent.DamageCause.LIGHTNING
+                || cause == EntityDamageEvent.DamageCause.WITHER
+                || cause == EntityDamageEvent.DamageCause.SONIC_BOOM
+                || cause == EntityDamageEvent.DamageCause.MAGIC
+                || cause == EntityDamageEvent.DamageCause.SUFFOCATION
+                || cause == EntityDamageEvent.DamageCause.FREEZE;
+        // 最低食物等级 4 且不能处于饥饿效果
+        if (player.getFoodLevel() < 4) return;
+        if (player.hasPotionEffect(PotionEffectType.HUNGER)) return;
+        double original = event.getDamage();
+        double reduced = original * 0.6; // 减免 40%
+        event.setDamage(reduced);
+        // 疲劳消耗：减免的伤害转化为疲劳（弱点双倍）
+        float exhaustion = (float) (original - reduced) * (weak ? 2.0f : 1.0f);
+        scheduleEntity(player, p -> p.setExhaustion(p.getExhaustion() + exhaustion));
     }
 
-    // ===== 弹射闪避：免疫弹射物 =====
+    // ===== 弹射闪避：被弹射物命中时传送到附近安全位置，每次扣 10 秒 =====
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onProjectile(EntityDamageByEntityEvent event) {
         if (event.getEntity() instanceof Player player
                 && event.getDamager() instanceof Projectile
                 && effectManager.has(player, KcEffect.PROJECTILE_DODGE)) {
             event.setCancelled(true);
+            // 随机传送到附近安全位置（水平 3-6 格）
+            Location loc = player.getLocation();
+            double angle = Math.random() * Math.PI * 2;
+            double dist = 3 + Math.random() * 3;
+            Location target = loc.clone().add(Math.cos(angle) * dist, 0.5, Math.sin(angle) * dist);
+            Block ground = target.clone().add(0, -1, 0).getBlock();
+            if (ground.getType().isSolid()) {
+                player.teleport(target);
+            }
+            // 扣 10 秒剩余时间；不足则效果消失
+            if (!effectManager.consumeTime(player, KcEffect.PROJECTILE_DODGE, 10000)) {
+                player.sendActionBar("§c✦ 弹射闪避已耗尽");
+            }
         }
+    }
+
+    // ===== 迟滞：对其他生物造成伤害时，给受击目标 5 秒 II 级缓慢 =====
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onAttack(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player player)) return;
+        if (!effectManager.has(player, KcEffect.HASTEN)) return;
+        if (event.getEntity() instanceof org.bukkit.entity.LivingEntity target) {
+            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 100, 1));
+        }
+    }
+
+    // ===== 生机：击杀成年年龄型生物时生成同类型幼体 =====
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onKill(org.bukkit.event.entity.EntityDeathEvent event) {
+        if (event.getEntity() instanceof Player) return;
+        org.bukkit.entity.LivingEntity dead = event.getEntity();
+        Player killer = dead.getKiller();
+        if (killer == null) return;
+        if (!effectManager.has(killer, KcEffect.VITALITY)) return;
+        // 生成同类型幼体（如击杀成年羊 → 小羊）
+        try {
+            if (dead instanceof org.bukkit.entity.Ageable ageable) {
+                Location loc = dead.getLocation();
+                org.bukkit.entity.LivingEntity baby = (org.bukkit.entity.LivingEntity) dead.getWorld().spawnEntity(loc, dead.getType());
+                if (baby instanceof org.bukkit.entity.Ageable babyAgeable) {
+                    babyAgeable.setBaby();
+                }
+                // 击杀成年僵尸 → 5% 概率生成小村民
+                if (dead.getType() == org.bukkit.entity.EntityType.ZOMBIE && Math.random() < 0.05) {
+                    baby.remove();
+                    org.bukkit.entity.LivingEntity villager = (org.bukkit.entity.LivingEntity) dead.getWorld().spawnEntity(loc, org.bukkit.entity.EntityType.VILLAGER);
+                    if (villager instanceof org.bukkit.entity.Ageable vAgeable) {
+                        vAgeable.setBaby();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ===== 胀气：每次按下潜行键获得一次向上的弹射速度 =====
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onSneak(org.bukkit.event.player.PlayerToggleSneakEvent event) {
+        if (!event.isSneaking()) return;
+        Player player = event.getPlayer();
+        if (!effectManager.has(player, KcEffect.BLOATING)) return;
+        scheduleEntity(player, p -> {
+            p.setVelocity(p.getVelocity().add(new org.bukkit.util.Vector(0, 0.9, 0)));
+            p.getWorld().playSound(p.getLocation(), org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
+        });
     }
 
     // ===== 即时熔炼：挖矿掉落熔炼产物 =====

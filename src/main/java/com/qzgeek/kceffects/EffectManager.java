@@ -74,6 +74,22 @@ public class EffectManager {
 
     // ===== 持久化 =====
 
+    /** 扣除效果剩余时间，返回 false 表示剩余时间不足、效果已消失 */
+    public boolean consumeTime(Player player, KcEffect effect, long consumeMillis) {
+        Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
+        if (map == null) return false;
+        ActiveEffect ae = map.get(effect);
+        if (ae == null) return false;
+        long newExpiry = ae.expiry - consumeMillis;
+        if (newExpiry <= System.currentTimeMillis()) {
+            map.remove(effect);
+            if (map.isEmpty()) activeEffects.remove(player.getUniqueId());
+            return false;
+        }
+        map.put(effect, new ActiveEffect(newExpiry, ae.totalTicks, ae.level));
+        return true;
+    }
+
     /** 获取某玩家的可持久化效果数据（effect名 -> 剩余tick） */
     public java.util.Map<String, Long> snapshot(Player player) {
         java.util.Map<String, Long> snap = new java.util.LinkedHashMap<>();
