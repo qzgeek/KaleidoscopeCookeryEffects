@@ -1,7 +1,7 @@
 name: KcEffects
-version: 1.0.7
+version: 2.0.0
 main: com.qzgeek.kceffects.KcEffectsPlugin
 api-version: '1.21'
 folia-supported: true
 depend: [CraftEngine]
-description: 森罗物语 Buff 移植 - 食物与茶食用后按官方百科获得对应效果
+description: 森罗物语 Buff 移植 v2.0 - 基于模组源码完整还原 12 种自定义效果

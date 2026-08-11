@@ -1,70 +1,197 @@
 package com.qzgeek.kceffects;
 
-import net.momirealms.craftengine.bukkit.item.BukkitItem;
 import net.momirealms.craftengine.core.item.Item;
 import net.momirealms.craftengine.core.item.ItemManager;
 import net.momirealms.craftengine.core.plugin.CraftEngine;
 import net.momirealms.craftengine.core.util.Key;
+import net.momirealms.craftengine.bukkit.api.event.FurnitureInteractEvent;
 import org.bukkit.Bukkit;
-import java.io.File;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.Sound;
+import org.bukkit.World;
 import org.bukkit.block.Block;
-import org.bukkit.entity.Player;
+import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityDamageByEntityEvent;
-import org.bukkit.event.entity.EntityDamageEvent;
-import org.bukkit.event.entity.EntityTargetEvent;
-import org.bukkit.event.player.PlayerItemConsumeEvent;
-import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.entity.*;
+import org.bukkit.event.player.PlayerItemConsumeEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerToggleSneakEvent;
+import org.bukkit.inventory.FurnaceRecipe;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.Recipe;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
-import org.bukkit.entity.Projectile;
-import org.bukkit.entity.Phantom;
-import org.bukkit.entity.Creeper;
+import org.bukkit.util.BoundingBox;
+import org.bukkit.util.Vector;
 
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 森罗物语 Buff 移植插件
- * 依据官方 wiki / MC百科：食物与茶食用后获得对应的 Buff
+ * 森罗物语 Buff 移植插件 — 重写版 2.0
+ *
+ * 基于模组源码 (KaleidoscopeMods/KaleidoscopeCookery) 完整还原 12 种自定义效果。
+ * Folia 兼容：所有实体操作通过 EntityScheduler 调度。
  */
 public class KcEffectsPlugin extends JavaPlugin implements Listener {
+
     private EffectManager effectManager;
-    private int tickCounter = 0;
+    private int tickCounter;
+    private Map<Material, Material> furnaceMap; // 熔炉配方缓存
+
+    // ---- 胀气会话标记：一次潜行会话仅触发一次，避免服务器取消潜行→客户端重按循环 ----
+    private final Map<UUID, Boolean> bloatingTriggered = new ConcurrentHashMap<>();
+
+    // ---- BossBar 展示 ----
+    private final Map<UUID, Map<KcEffect, org.bukkit.boss.BossBar>> bossBars = new ConcurrentHashMap<>();
+
+    // ==================== 生命周期 ====================
 
     @Override
     public void onEnable() {
         effectManager = new EffectManager();
-        // 尝试注册自定义效果到服务端注册表（效果栏显示）
-        boolean registered = EffectRegistrar.registerCustomEffects(this);
+        buildFurnaceMap();
+        EffectRegistrar.registerCustomEffects(this);
         getServer().getPluginManager().registerEvents(this, this);
-        // Folia 兼容：全局区域调度器，每 20 tick 执行一次效果逻辑
-        Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, task -> tick(), 20, 20);
-        getLogger().info("森罗物语 Buff 插件已启用（" + FoodEffects.MAP.size() + " 种食物/茶效果"
-                + (registered ? "，自定义效果已注册" : "，事件驱动模式") + "）");
+        Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, task -> tick(), 1, 1);
+        getLogger().info("森罗物语 Buff 插件 v2.0 已启用（" + FoodEffects.MAP.size()
+                + " 种食物/茶效果，模组原版逻辑还原）");
     }
 
     @Override
     public void onDisable() {
         if (effectManager != null) effectManager.cleanup();
         for (Map<KcEffect, org.bukkit.boss.BossBar> bars : bossBars.values()) {
-            for (org.bukkit.boss.BossBar bar : bars.values()) {
-                bar.removeAll();
-            }
+            for (org.bukkit.boss.BossBar bar : bars.values()) bar.removeAll();
         }
         bossBars.clear();
         getLogger().info("森罗物语 Buff 插件已卸载");
     }
 
-    // ===== 食用事件 =====
+    /** 构建熔炉配方缓存（用于即时熔炼效果） */
+    private void buildFurnaceMap() {
+        furnaceMap = new HashMap<>();
+        Iterator<Recipe> it = Bukkit.recipeIterator();
+        while (it.hasNext()) {
+            Recipe r = it.next();
+            if (r instanceof FurnaceRecipe fr) {
+                Material input = fr.getInput().getType();
+                Material output = fr.getResult().getType();
+                furnaceMap.putIfAbsent(input, output); // 优先保留第一个配方
+            }
+        }
+        getLogger().info("熔炉配方缓存: " + furnaceMap.size() + " 条");
+    }
+
+    // ==================== 每 tick 调度 ====================
+
+    private void tick() {
+        tickCounter++;
+        effectManager.cleanup();
+
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            updateBossBars(player);
+
+            // === 活力：奔跑时每 tick 重置疲劳值（模组: isDurationEffectTick=true） ===
+            if (effectManager.has(player, KcEffect.VIGOR) && player.isSprinting()) {
+                scheduleEntity(player, p -> p.setExhaustion(0f));
+            }
+
+            // === 硫磺：每 5 tick 主动扫描附近幻翼并清除目标（模组: duration%5==0） ===
+            if (tickCounter % 5 == 0 && effectManager.has(player, KcEffect.SULFUR)) {
+                scheduleEntity(player, p -> {
+                    Location pl = p.getLocation();
+                    BoundingBox box = new BoundingBox(
+                            pl.getX() - 8, pl.getY() - 16, pl.getZ() - 8,
+                            pl.getX() + 8, pl.getY() + 16, pl.getZ() + 8);
+                    for (Entity e : p.getWorld().getNearbyEntities(box, e -> e instanceof Phantom)) {
+                        Phantom ph = (Phantom) e;
+                        if (p.equals(ph.getTarget())) ph.setTarget(null);
+                    }
+                });
+            }
+
+            // === 温暖：每秒检查热源回血（模组: duration%20==0） ===
+            if (tickCounter % 20 == 0 && effectManager.has(player, KcEffect.WARMTH)) {
+                scheduleEntity(player, p -> {
+                    if (p.getHealth() >= p.getMaxHealth()) return;
+                    if (hasHeatSourceNearby(p)) {
+                        p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 1.0));
+                    } else if (p.getWorld().getEnvironment() == World.Environment.NETHER) {
+                        if (Math.random() < 0.25) {
+                            p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 0.5));
+                        }
+                    }
+                });
+            }
+
+            // === 寒带疾行：每 2 秒更新移速，效果结束时恢复 0.2（模组: BaseEffect无tick，但通过属性实现） ===
+            if (tickCounter % 40 == 0) {
+                boolean hasColdStride = effectManager.has(player, KcEffect.COLD_STRIDE);
+                scheduleEntity(player, p -> {
+                    if (hasColdStride) {
+                        Block below = p.getLocation().add(0, -0.5, 0).getBlock();
+                        p.setWalkSpeed(isColdBlock(below.getType()) ? 0.28f : 0.2f);
+                    } else {
+                        p.setWalkSpeed(0.2f);
+                    }
+                });
+            }
+        }
+    }
+
+    /** 检查周围 5×5×3 是否有热源（含点燃状态检测，匹配 mod WarmthEffect） */
+    private boolean hasHeatSourceNearby(Player player) {
+        Location loc = player.getLocation();
+        World w = player.getWorld();
+        int bx = loc.getBlockX(), by = loc.getBlockY(), bz = loc.getBlockZ();
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    Block b = w.getBlockAt(bx + dx, by + dy, bz + dz);
+                    Material m = b.getType();
+                    // 直接热源
+                    if (m == Material.FIRE || m == Material.SOUL_FIRE
+                            || m == Material.LAVA || m == Material.MAGMA_BLOCK) {
+                        return true;
+                    }
+                    // 营火（需点燃）
+                    if ((m == Material.CAMPFIRE || m == Material.SOUL_CAMPFIRE)
+                            && b.getBlockData() instanceof org.bukkit.block.data.Lightable la
+                            && la.isLit()) {
+                        return true;
+                    }
+                    // 熔炉/烟熏炉/高炉（需点燃；匹配 BlockStateProperties.LIT）
+                    if ((m == Material.FURNACE || m == Material.BLAST_FURNACE
+                            || m == Material.SMOKER)
+                            && b.getBlockData() instanceof org.bukkit.block.data.Lightable la
+                            && la.isLit()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 匹配模组 tundra_strider_speed_blocks 标签 */
+    private boolean isColdBlock(Material mat) {
+        return mat == Material.SNOW_BLOCK || mat == Material.SNOW
+                || mat == Material.ICE || mat == Material.PACKED_ICE
+                || mat == Material.BLUE_ICE || mat == Material.FROSTED_ICE
+                || mat == Material.POWDER_SNOW;
+    }
+
+    // ==================== 食用事件 ====================
+
     @EventHandler(priority = EventPriority.HIGH)
     public void onConsume(PlayerItemConsumeEvent event) {
         Player player = event.getPlayer();
@@ -77,7 +204,7 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         String spec = FoodEffects.MAP.get(itemId);
         if (spec == null) return;
 
-        // 处理特殊效果
+        // 黑暗料理：33% 概率失明+中毒
         if (spec.equals("DARK_CUISINE")) {
             if (Math.random() < 0.33) {
                 player.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 300, 0));
@@ -85,6 +212,7 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
             }
             return;
         }
+        // 谜之炒菜：15% 概率随机效果
         if (spec.equals("SUSPICIOUS")) {
             if (Math.random() < 0.15) {
                 PotionEffectType[] types = {
@@ -99,9 +227,69 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // 常规效果：A|B|C
+        // 常规效果：A|B|C 管道分隔
         for (String effectSpec : spec.split("\\|")) {
             applyEffect(player, effectSpec);
+        }
+    }
+
+    // ===== 放置菜肴食用：通过 CraftEngine FurnitureInteractEvent 捕获 =====
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFurnitureEat(FurnitureInteractEvent event) {
+        if (event.isCancelled()) return;
+        Player player = event.player();
+        // 通过家具持久化数据获取菜品物品 ID
+        Optional<Item> sourceItem = event.furniture().persistentData.item();
+        if (sourceItem.isEmpty()) return;
+
+        Item item = sourceItem.get();
+        Optional<Key> customId = item.customId();
+        if (customId.isEmpty()) return;
+
+        String itemId = customId.get().toString();
+        String spec = FoodEffects.MAP.get(itemId);
+        if (spec == null) return;
+
+        // 检查是否已有效果（同类覆盖重置时长），防止连续吃多口时反复弹 ActionBar
+        boolean alreadyHas = effectManager.has(player, getEffectFromSpec(spec));
+
+        for (String effectSpec : spec.split("\\|")) {
+            applyEffectFurniture(player, effectSpec);
+        }
+
+        if (!alreadyHas) {
+            player.sendActionBar("§a✦ 享用美食获得效果");
+        }
+    }
+
+    /** 从效果规格中提取第一个自定义效果（用于检测是否已持有） */
+    private KcEffect getEffectFromSpec(String spec) {
+        for (String s : spec.split("\\|")) {
+            String[] parts = s.split(":");
+            if (!parts[0].equals("VANILLA")) {
+                try { return KcEffect.valueOf(parts[0]); } catch (Exception ignored) {}
+            }
+        }
+        return null;
+    }
+
+    /** 家具食用专用：静默应用效果（ActionBar 由调用方控制） */
+    private void applyEffectFurniture(Player player, String spec) {
+        try {
+            String[] parts = spec.split(":");
+            if (parts[0].equals("VANILLA")) {
+                PotionEffectType type = PotionEffectType.getByName(parts[2].toUpperCase());
+                if (type == null) return;
+                int ticks = Integer.parseInt(parts[3]);
+                int level = parts.length > 4 ? Integer.parseInt(parts[4]) : 0;
+                player.addPotionEffect(new PotionEffect(type, ticks, level));
+            } else {
+                KcEffect effect = KcEffect.valueOf(parts[0]);
+                int ticks = Integer.parseInt(parts[1]);
+                int level = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
+                effectManager.apply(player, effect, ticks, level);
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -121,7 +309,6 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
                 int ticks = Integer.parseInt(parts[1]);
                 int level = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
                 effectManager.apply(player, effect, ticks, level);
-                // action bar 提示效果获得
                 String dur = formatDuration(ticks);
                 player.sendActionBar("§a✦ 获得效果：§f" + effect.displayName() + " §7(" + dur + ")");
             }
@@ -131,259 +318,190 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
 
     private String formatDuration(int ticks) {
         int sec = ticks / 20;
-        if (sec >= 60) {
-            return (sec / 60) + "分" + (sec % 60 > 0 ? (sec % 60) + "秒" : "");
-        }
+        if (sec >= 60) return (sec / 60) + "分" + (sec % 60 > 0 ? (sec % 60) + "秒" : "");
         return sec + "秒";
     }
 
-    // ===== 效果逻辑 tick（每秒 20 tick 调用一次）=====
-    private void tick() {
-        tickCounter++;
-        effectManager.cleanup();
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            // 更新自定义效果的 BossBar 展示
-            updateBossBars(player);
-            // 活力：奔跑时将疲劳值重置为 0（每 5 tick）
-            if (effectManager.has(player, KcEffect.VIGOR) && player.isSprinting() && tickCounter % 5 == 0) {
-                scheduleEntity(player, p -> p.setExhaustion(0f));
-            }
-            // 寒带疾行：雪/冰/细雪上加速（每 2 秒更新，效果结束恢复 0.2）
-            if (tickCounter % 2 == 0) {
-                boolean hasColdStride = effectManager.has(player, KcEffect.COLD_STRIDE);
-                scheduleEntity(player, p -> {
-                    if (hasColdStride) {
-                        Block below = p.getLocation().add(0, -0.5, 0).getBlock();
-                        p.setWalkSpeed(isColdBlock(below.getType()) ? 0.28f : 0.2f);
-                    } else {
-                        p.setWalkSpeed(0.2f);
-                    }
-                });
-            }
-            // 温暖：热源附近每秒恢复 1 点生命；下界 25% 概率恢复 0.5
-            if (effectManager.has(player, KcEffect.WARMTH) && tickCounter % 2 == 0) {
-                scheduleEntity(player, p -> {
-                    if (p.getHealth() >= p.getMaxHealth()) return;
-                    boolean inNether = p.getWorld().getEnvironment() == org.bukkit.World.Environment.NETHER;
-                    if (inNether) {
-                        if (Math.random() < 0.25) {
-                            p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 0.5));
-                        }
-                    } else if (hasHeatSourceNearby(p)) {
-                        p.setHealth(Math.min(p.getMaxHealth(), p.getHealth() + 1.0));
-                    }
-                });
+    // ==================== 保鲜：有害效果移除（匹配 mod PreservationEvent） ====================
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPreservation(PlayerItemConsumeEvent event) {
+        Player player = event.getPlayer();
+        if (!effectManager.has(player, KcEffect.PRESERVATION)) return;
+
+        ItemStack stack = event.getItem();
+        if (!stack.getType().isEdible()) return;
+
+        // 模拟模组：遍历食物的 effects，移除 HARMFUL 类的效果
+        // Bukkit 无法直接读取 food effects，使用启发式方法
+        for (PotionEffect pe : player.getActivePotionEffects()) {
+            PotionEffectType t = pe.getType();
+            if (t == PotionEffectType.POISON || t == PotionEffectType.HUNGER
+                    || t == PotionEffectType.NAUSEA || t == PotionEffectType.WEAKNESS
+                    || t == PotionEffectType.BLINDNESS
+                    || t == PotionEffectType.WITHER || t == PotionEffectType.BAD_OMEN
+                    || t == PotionEffectType.UNLUCK || t == PotionEffectType.DARKNESS
+                    || t == PotionEffectType.MINING_FATIGUE || t == PotionEffectType.SLOWNESS) {
+                player.removePotionEffect(t);
             }
         }
     }
 
-    /** 检查周围 5×5×3 范围内是否有热源 */
-    private boolean hasHeatSourceNearby(Player player) {
+    // ==================== 饱腹代偿（匹配 mod SatiatedShieldEvent） ====================
+
+    // 默认配置值（与模组 GeneralConfig 默认值一致）
+    private static final double DAMAGE_REDUCTION_PERCENT = 1.0;
+    private static final double MAX_DAMAGE_REDUCTION = 64.0;
+    private static final double MIN_DAMAGE = 0.0;
+    private static final double EXHAUSTION_PER_DAMAGE = 2.0;
+    private static final double WEAKNESS_MULTIPLIER = 2.0;
+    private static final int MIN_FOOD_LEVEL = 4;
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onSatiatedShield(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Player player)) return;
+        if (!effectManager.has(player, KcEffect.SATIETY)) return;
+        if (event.isCancelled()) return;
+
+        // 饱腹代偿失效条件：饥饿效果 + food 等级不足
+        if (player.hasPotionEffect(PotionEffectType.HUNGER)) return;
+        if (player.getFoodLevel() < MIN_FOOD_LEVEL) return;
+
+        float original = (float) event.getDamage();
+        // 1. 计算减免量（原伤害 × 减免百分比，上限 MAX_DAMAGE_REDUCTION）
+        float reduced = Math.min((float) (original * DAMAGE_REDUCTION_PERCENT), (float) MAX_DAMAGE_REDUCTION);
+        float finalDamage = original - reduced;
+        // 2. 不低于 MIN_DAMAGE
+        if (original > MIN_DAMAGE) {
+            finalDamage = Math.max(finalDamage, (float) MIN_DAMAGE);
+            reduced = original - finalDamage;
+        }
+
+        // 3. 计算疲劳消耗
+        float exhaustion = reduced * (float) EXHAUSTION_PER_DAMAGE;
+
+        // 4. 弱点伤害类型双倍消耗
+        EntityDamageEvent.DamageCause cause = event.getCause();
+        boolean weak = cause == EntityDamageEvent.DamageCause.WITHER
+                || cause == EntityDamageEvent.DamageCause.SONIC_BOOM
+                || cause == EntityDamageEvent.DamageCause.MAGIC
+                || cause == EntityDamageEvent.DamageCause.SUFFOCATION
+                || cause == EntityDamageEvent.DamageCause.FREEZE
+                || cause == EntityDamageEvent.DamageCause.LIGHTNING
+                || cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION
+                || cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION;
+        if (weak) exhaustion *= WEAKNESS_MULTIPLIER;
+
+        // 5. 应用最终伤害 + 疲劳
+        event.setDamage(Math.max(0, finalDamage));
+        final float fExhaustion = Math.max(0, exhaustion);
+        scheduleEntity(player, p -> p.setExhaustion(p.getExhaustion() + fExhaustion));
+    }
+
+    // ==================== 弹射闪避（匹配 mod ProjectileDodgeEvent） ====================
+
+    private static final int DODGE_COST_TICKS = 200; // 每次闪避消耗 10 秒
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onProjectileHit(EntityDamageByEntityEvent event) {
+        if (!(event.getEntity() instanceof Player player)) return;
+        if (!(event.getDamager() instanceof Projectile)) return;
+        if (!effectManager.has(player, KcEffect.PROJECTILE_DODGE)) return;
+
+        event.setCancelled(true);
+
+        // 随机传送（匹配 mod randomTeleport: range 3-16, maxAttempts 16）
+        randomTeleport(player, 3, 16);
+
+        // 消耗时间
+        if (!effectManager.consumeTicks(player, KcEffect.PROJECTILE_DODGE, DODGE_COST_TICKS)) {
+            player.sendActionBar("§c✦ 弹射闪避已耗尽");
+        }
+    }
+
+    /** 模组 randomTeleport：多次尝试传送到安全位置，失败则原地。 */
+    private void randomTeleport(Player player, double minRange, int maxAttempts) {
         Location loc = player.getLocation();
-        int bx = loc.getBlockX(), by = loc.getBlockY(), bz = loc.getBlockZ();
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -2; dz <= 2; dz++) {
-                    Block b = player.getWorld().getBlockAt(bx + dx, by + dy, bz + dz);
-                    Material m = b.getType();
-                    if (m == Material.CAMPFIRE || m == Material.SOUL_CAMPFIRE
-                            || m == Material.FIRE || m == Material.SOUL_FIRE
-                            || m == Material.LAVA || m == Material.MAGMA_BLOCK) {
-                        return true;
+        World world = player.getWorld();
+        double x = loc.getX(), y = loc.getY(), z = loc.getZ();
+        int minH = world.getMinHeight();
+        int maxH = world.getMaxHeight();
+        double range = 16.0; // 匹配模组最大 range
+
+        for (int i = 0; i < maxAttempts; i++) {
+            double tx = x + (Math.random() - 0.5) * range;
+            double ty = Math.clamp(y + (Math.random() - 0.5) * range, minH, minH + maxH - 1);
+            double tz = z + (Math.random() - 0.5) * range;
+
+            Location target = new Location(world, tx, ty, tz);
+
+            // 检查目标位置是否安全（非固体 + 下方有支撑）
+            Block targetBlock = target.getBlock();
+            Block belowBlock = target.clone().add(0, -1, 0).getBlock();
+
+            if (!targetBlock.getType().isSolid()
+                    && belowBlock.getType().isSolid()
+                    && !belowBlock.getType().toString().contains("LAVA")) {
+                // 安全的传送位置
+                if (player.isInsideVehicle()) player.leaveVehicle();
+                final Location safeLoc = target.clone();
+                player.teleportAsync(safeLoc).thenAccept(success -> {
+                    if (Boolean.TRUE.equals(success)) {
+                        world.playSound(safeLoc, Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
                     }
-                }
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Folia 兼容：实体操作必须在实体所属区域线程执行。
-     * 使用 EntityScheduler 调度到正确线程；非 Folia 环境直接执行。
-     */
-    private void scheduleEntity(Player player, java.util.function.Consumer<Player> action) {
-        if (player == null || !player.isOnline()) return;
-        try {
-            player.getScheduler().run(this, task -> {
-                if (player.isOnline()) {
-                    action.accept(player);
-                }
-            }, null);
-        } catch (Throwable ignored) {
-            try {
-                action.accept(player);
-            } catch (Throwable ignored2) {
-            }
-        }
-    }
-
-    private boolean isColdBlock(Material mat) {
-        return mat == Material.SNOW_BLOCK || mat == Material.SNOW
-                || mat == Material.ICE || mat == Material.PACKED_ICE
-                || mat == Material.BLUE_ICE || mat == Material.POWDER_SNOW;
-    }
-
-    // ===== BossBar 展示自定义效果 =====
-    private final Map<UUID, Map<KcEffect, org.bukkit.boss.BossBar>> bossBars = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private void updateBossBars(Player player) {
-        UUID uid = player.getUniqueId();
-        Map<KcEffect, EffectManager.ActiveEffect> active = effectManager.getActive(player);
-        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.computeIfAbsent(uid, k -> new java.util.concurrent.ConcurrentHashMap<>());
-        long now = System.currentTimeMillis();
-
-        // 确保有效果的都有 BossBar
-        for (Map.Entry<KcEffect, EffectManager.ActiveEffect> entry : active.entrySet()) {
-            KcEffect kc = entry.getKey();
-            EffectManager.ActiveEffect ae = entry.getValue();
-            org.bukkit.boss.BossBar bar = bars.get(kc);
-            if (bar == null) {
-                // 负面效果红色，正面效果绿色
-                boolean negative = kc == KcEffect.BLOATING;
-                bar = Bukkit.createBossBar(
-                        "§" + (negative ? "c" : "a") + "✦ " + kc.displayName(),
-                        negative ? org.bukkit.boss.BarColor.RED : org.bukkit.boss.BarColor.GREEN,
-                        org.bukkit.boss.BarStyle.SOLID);
-                bar.addPlayer(player);
-                bars.put(kc, bar);
-            }
-            // 更新标题（效果名 + 剩余时间）和进度
-            long remainMs = Math.max(0, ae.expiry - now);
-            double progress = (double) remainMs / (ae.totalTicks * 50L);
-            bar.setProgress(Math.max(0.0, Math.min(1.0, progress)));
-            int remainSec = (int) (remainMs / 1000);
-            String remain = formatDuration(remainSec * 20);
-            String level = ae.level > 0 ? " " + toRoman(ae.level + 1) : "";
-            boolean neg = kc == KcEffect.BLOATING;
-            bar.setTitle("§" + (neg ? "c" : "a") + "✦ " + kc.displayName() + level + " ✦ §7" + remain);
-        }
-
-        // 移除已过期的 BossBar
-        for (java.util.Iterator<Map.Entry<KcEffect, org.bukkit.boss.BossBar>> it = bars.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<KcEffect, org.bukkit.boss.BossBar> entry = it.next();
-            if (!active.containsKey(entry.getKey())) {
-                entry.getValue().removePlayer(player);
-                entry.getValue().removeAll();
-                it.remove();
-            }
-        }
-
-        if (bars.isEmpty() && active.isEmpty()) {
-            bossBars.remove(uid);
-        }
-    }
-
-    private String toRoman(int n) {
-        switch (n) {
-            case 2: return "II";
-            case 3: return "III";
-            case 4: return "IV";
-            default: return "I";
-        }
-    }
-
-    @EventHandler
-    public void onQuit(org.bukkit.event.player.PlayerQuitEvent event) {
-        UUID uid = event.getPlayer().getUniqueId();
-        // 保存效果到磁盘
-        saveEffects(event.getPlayer());
-        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
-        if (bars != null) {
-            for (org.bukkit.boss.BossBar bar : bars.values()) {
-                bar.removeAll();
-            }
-        }
-        effectManager.remove(event.getPlayer());
-    }
-
-    @EventHandler
-    public void onDeath(org.bukkit.event.entity.PlayerDeathEvent event) {
-        // 与原版药水一致：死亡后清除所有效果
-        Player player = event.getEntity();
-        UUID uid = player.getUniqueId();
-        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
-        if (bars != null) {
-            for (org.bukkit.boss.BossBar bar : bars.values()) {
-                bar.removeAll();
-            }
-        }
-        effectManager.remove(player);
-        bloatingTriggered.remove(uid);
-    }
-
-    @EventHandler
-    public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) {
-        // 恢复上次下线的效果
-        java.util.Map<String, Long> saved = loadEffects(event.getPlayer().getUniqueId());
-        if (saved != null && !saved.isEmpty()) {
-            effectManager.restore(event.getPlayer(), saved);
-            deleteEffects(event.getPlayer().getUniqueId());
-        }
-    }
-
-    // ===== 效果持久化（下线暂存，上线恢复）=====
-    private File getDataFile(UUID uuid) {
-        File dir = new File(getDataFolder(), "effects");
-        if (!dir.exists()) dir.mkdirs();
-        return new File(dir, uuid + ".yml");
-    }
-
-    private void saveEffects(Player player) {
-        try {
-            java.util.Map<String, Long> snap = effectManager.snapshot(player);
-            if (snap.isEmpty()) {
-                deleteEffects(player.getUniqueId());
+                });
                 return;
             }
-            File f = getDataFile(player.getUniqueId());
-            StringBuilder sb = new StringBuilder();
-            sb.append("# 下线暂存效果\n");
-            for (java.util.Map.Entry<String, Long> e : snap.entrySet()) {
-                sb.append(e.getKey()).append(": ").append(e.getValue()).append('\n');
+        }
+        // 失败 - 保持在原位（不做传送）
+    }
+
+    // ==================== 迟滞：攻击目标缓慢 II 5秒（匹配 mod HinderEvent） ====================
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onHinder(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player player)) return;
+        if (!effectManager.has(player, KcEffect.HASTEN)) return;
+        if (event.getEntity() instanceof LivingEntity target) {
+            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 100, 1));
+        }
+    }
+
+    // ==================== 生机：击杀成年生物生成幼体（匹配 mod VitalityEvent） ====================
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onVitality(EntityDeathEvent event) {
+        if (event.getEntity() instanceof Player) return;
+        LivingEntity dead = event.getEntity();
+        Player killer = dead.getKiller();
+        if (killer == null || !effectManager.has(killer, KcEffect.VITALITY)) return;
+
+        Location loc = dead.getLocation();
+        EntityType type = dead.getType();
+
+        try {
+            // AgeableMob 成年 → 生成同类型幼体
+            if (dead instanceof Ageable && !((Ageable) dead).isAdult()) return;
+            if (dead instanceof Ageable ageable) {
+                Entity baby = dead.getWorld().spawnEntity(loc, type);
+                if (baby instanceof Ageable babyAgeable) {
+                    babyAgeable.setBaby();
+                }
+                // 僵尸额外：5% 概率生成小村民
+                if (type == EntityType.ZOMBIE && Math.random() < 0.05) {
+                    baby.remove();
+                    Entity villager = dead.getWorld().spawnEntity(loc, EntityType.VILLAGER);
+                    if (villager instanceof Ageable vAgeable) vAgeable.setBaby();
+                }
+                return;
             }
-            java.nio.file.Files.write(f.toPath(), sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            // 非 Ageable 但有幼体形态？跳过
         } catch (Exception ignored) {
         }
     }
 
-    private java.util.Map<String, Long> loadEffects(UUID uuid) {
-        File f = getDataFile(uuid);
-        if (!f.exists()) return null;
-        try {
-            java.util.Map<String, Long> data = new java.util.LinkedHashMap<>();
-            for (String line : java.nio.file.Files.readAllLines(f.toPath(), java.nio.charset.StandardCharsets.UTF_8)) {
-                String trimmed = line.trim();
-                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
-                String[] parts = trimmed.split(":", 2);
-                if (parts.length == 2) {
-                    data.put(parts[0].trim(), Long.parseLong(parts[1].trim()));
-                }
-            }
-            return data;
-        } catch (Exception e) {
-            return null;
-        }
-    }
+    // ==================== 芥末：苦力怕逃离 / 硫磺事件 ====================
 
-    private void deleteEffects(UUID uuid) {
-        File f = getDataFile(uuid);
-        if (f.exists()) f.delete();
-    }
-
-    // ===== 保鲜：食用坏食物无负面 =====
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onBadConsume(PlayerItemConsumeEvent event) {
-        if (!effectManager.has(event.getPlayer(), KcEffect.PRESERVATION)) return;
-        Material type = event.getItem().getType();
-        if (type == Material.ROTTEN_FLESH || type == Material.CHICKEN
-                || type == Material.POISONOUS_POTATO || type == Material.PUFFERFISH
-                || type == Material.SPIDER_EYE) {
-            event.getPlayer().removePotionEffect(PotionEffectType.POISON);
-            event.getPlayer().removePotionEffect(PotionEffectType.HUNGER);
-        }
-    }
-
-    // ===== 硫磺：幻翼逃离 / 芥末：苦力怕逃离 =====
     @EventHandler(priority = EventPriority.HIGH)
     public void onTarget(EntityTargetEvent event) {
         if (!(event.getTarget() instanceof Player player)) return;
@@ -399,165 +517,202 @@ public class KcEffectsPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ===== 饱腹代偿：受伤害时降低伤害，消耗饱和度和饥饿值 =====
-    @EventHandler(priority = EventPriority.HIGH)
-    public void onDamage(EntityDamageEvent event) {
-        if (!(event.getEntity() instanceof Player player)) return;
-        if (!effectManager.has(player, KcEffect.SATIETY)) return;
-        if (event.isCancelled()) return;
-        // 弱点伤害：爆炸/闪电/凋零/音波/间接魔法/窒息/冻结 → 双倍疲劳消耗
-        EntityDamageEvent.DamageCause cause = event.getCause();
-        boolean weak = cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION
-                || cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION
-                || cause == EntityDamageEvent.DamageCause.LIGHTNING
-                || cause == EntityDamageEvent.DamageCause.WITHER
-                || cause == EntityDamageEvent.DamageCause.SONIC_BOOM
-                || cause == EntityDamageEvent.DamageCause.MAGIC
-                || cause == EntityDamageEvent.DamageCause.SUFFOCATION
-                || cause == EntityDamageEvent.DamageCause.FREEZE;
-        // 最低食物等级 4 且不能处于饥饿效果
-        if (player.getFoodLevel() < 4) return;
-        if (player.hasPotionEffect(PotionEffectType.HUNGER)) return;
-        double original = event.getDamage();
-        double reduced = original * 0.6; // 减免 40%
-        event.setDamage(reduced);
-        // 疲劳消耗：减免的伤害转化为疲劳（弱点双倍）
-        float exhaustion = (float) (original - reduced) * (weak ? 2.0f : 1.0f);
-        scheduleEntity(player, p -> p.setExhaustion(p.getExhaustion() + exhaustion));
-    }
-
-    // ===== 弹射闪避：被弹射物命中时传送到附近安全位置，每次扣 10 秒 =====
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onProjectile(EntityDamageByEntityEvent event) {
-        if (event.getEntity() instanceof Player player
-                && event.getDamager() instanceof Projectile
-                && effectManager.has(player, KcEffect.PROJECTILE_DODGE)) {
-            event.setCancelled(true);
-            // 随机传送到附近安全位置（水平 3-6 格）
-            Location loc = player.getLocation();
-            double angle = Math.random() * Math.PI * 2;
-            double dist = 3 + Math.random() * 3;
-            Location target = loc.clone().add(Math.cos(angle) * dist, 0.5, Math.sin(angle) * dist);
-            Block ground = target.clone().add(0, -1, 0).getBlock();
-            if (ground.getType().isSolid()) {
-                player.teleport(target);
-            }
-            // 扣 10 秒剩余时间；不足则效果消失
-            if (!effectManager.consumeTime(player, KcEffect.PROJECTILE_DODGE, 10000)) {
-                player.sendActionBar("§c✦ 弹射闪避已耗尽");
-            }
-        }
-    }
-
-    // ===== 迟滞：对其他生物造成伤害时，给受击目标 5 秒 II 级缓慢 =====
-    @EventHandler(priority = EventPriority.HIGH)
-    public void onAttack(EntityDamageByEntityEvent event) {
-        if (!(event.getDamager() instanceof Player player)) return;
-        if (!effectManager.has(player, KcEffect.HASTEN)) return;
-        if (event.getEntity() instanceof org.bukkit.entity.LivingEntity target) {
-            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 100, 1));
-        }
-    }
-
-    // ===== 生机：击杀成年年龄型生物时生成同类型幼体 =====
-    @EventHandler(priority = EventPriority.HIGH)
-    public void onKill(org.bukkit.event.entity.EntityDeathEvent event) {
-        if (event.getEntity() instanceof Player) return;
-        org.bukkit.entity.LivingEntity dead = event.getEntity();
-        Player killer = dead.getKiller();
-        if (killer == null) return;
-        if (!effectManager.has(killer, KcEffect.VITALITY)) return;
-        // 生成同类型幼体（如击杀成年羊 → 小羊）
-        try {
-            if (dead instanceof org.bukkit.entity.Ageable ageable) {
-                Location loc = dead.getLocation();
-                org.bukkit.entity.LivingEntity baby = (org.bukkit.entity.LivingEntity) dead.getWorld().spawnEntity(loc, dead.getType());
-                if (baby instanceof org.bukkit.entity.Ageable babyAgeable) {
-                    babyAgeable.setBaby();
-                }
-                // 击杀成年僵尸 → 5% 概率生成小村民
-                if (dead.getType() == org.bukkit.entity.EntityType.ZOMBIE && Math.random() < 0.05) {
-                    baby.remove();
-                    org.bukkit.entity.LivingEntity villager = (org.bukkit.entity.LivingEntity) dead.getWorld().spawnEntity(loc, org.bukkit.entity.EntityType.VILLAGER);
-                    if (villager instanceof org.bukkit.entity.Ageable vAgeable) {
-                        vAgeable.setBaby();
-                    }
-                }
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    // ===== 胀气：点击一次潜行给予一次垂直加速（约升高 2 格）=====
-    // 一次潜行会话仅触发一次；保持潜行不触发；允许空中触发；无冷却。
-    // 用会话标记防止"服务器弹射强制取消潜行→客户端重按"导致的循环触发。
-    private final Map<UUID, Boolean> bloatingTriggered = new java.util.concurrent.ConcurrentHashMap<>();
+    // ==================== 即时熔炼（匹配 mod InstantSmeltingEffect） ====================
 
     @EventHandler(priority = EventPriority.HIGH)
-    public void onSneak(org.bukkit.event.player.PlayerToggleSneakEvent event) {
+    public void onInstantSmelt(BlockBreakEvent event) {
         Player player = event.getPlayer();
+        if (!effectManager.has(player, KcEffect.INSTANT_SMELT)) return;
+
+        Material broken = event.getBlock().getType();
+        Material smelted = furnaceMap.get(broken);
+        if (smelted == null) return;
+
+        // 获取效果等级：amplifier + 1 个物品可被熔炼
+        EffectManager.ActiveEffect ae = effectManager.getActive(player).get(KcEffect.INSTANT_SMELT);
+        int maxSmelt = (ae != null) ? ae.level + 1 : 1;
+
+        // 先用原版掉落系统获取掉落物，然后替换
+        // 简化方案：移除默认掉落，手动生成熔炼产物（最多 maxSmelt 个）
+        event.setDropItems(false);
+        for (int i = 0; i < maxSmelt; i++) {
+            event.getBlock().getWorld().dropItemNaturally(
+                    event.getBlock().getLocation(), new ItemStack(smelted));
+        }
+    }
+
+    // ==================== 胀气：潜行弹射（匹配 mod FlatulenceEvent） ====================
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onBloatingSneak(PlayerToggleSneakEvent event) {
+        Player player = event.getPlayer();
+        if (!effectManager.has(player, KcEffect.BLOATING)) return;
+
         if (event.isSneaking()) {
-            if (!effectManager.has(player, KcEffect.BLOATING)) return;
-            // 本次潜行会话已触发过则跳过（防止服务器取消潜行后客户端重按导致的循环）
+            // 本次潜行会话已触发过，跳过
             if (Boolean.TRUE.equals(bloatingTriggered.get(player.getUniqueId()))) return;
             bloatingTriggered.put(player.getUniqueId(), true);
+
             scheduleEntity(player, p -> {
-                // 直接设置垂直速度（保留水平速度），不累加避免叠加
-                org.bukkit.util.Vector v = p.getVelocity();
-                p.setVelocity(new org.bukkit.util.Vector(v.getX(), 0.56, v.getZ()));
-                p.getWorld().playSound(p.getLocation(), org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
+                // 匹配模组：addDeltaMovement(0, 0.75, 0)
+                Vector v = p.getVelocity();
+                p.setVelocity(new Vector(v.getX(), 0.75, v.getZ()));
+                p.getWorld().playSound(p.getLocation(), Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.5f, 1.2f);
             });
         } else {
-            // 玩家主动松开潜行 → 重置，下次点击可再次触发
+            // 玩家主动松开潜行 → 重置标记
             bloatingTriggered.remove(player.getUniqueId());
         }
     }
 
-    // ===== 即时熔炼：挖矿掉落熔炼产物 =====
-    @EventHandler(priority = EventPriority.HIGH)
-    public void onBreak(BlockBreakEvent event) {
-        if (!effectManager.has(event.getPlayer(), KcEffect.INSTANT_SMELT)) return;
-        Material mat = event.getBlock().getType();
-        Material smelted = getSmeltResult(mat);
-        if (smelted == null) return;
-        // 移除默认掉落，改为熔炼产物
-        event.setDropItems(false);
-        Location loc = event.getBlock().getLocation();
-        event.getBlock().getWorld().dropItemNaturally(loc, new ItemStack(smelted));
+    // ==================== BossBar 展示 ====================
+
+    private void updateBossBars(Player player) {
+        UUID uid = player.getUniqueId();
+        Map<KcEffect, EffectManager.ActiveEffect> active = effectManager.getActive(player);
+        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.computeIfAbsent(uid,
+                k -> new ConcurrentHashMap<>());
+        long now = System.currentTimeMillis();
+
+        // 为每个活跃效果创建/更新 BossBar
+        for (Map.Entry<KcEffect, EffectManager.ActiveEffect> entry : active.entrySet()) {
+            KcEffect kc = entry.getKey();
+            EffectManager.ActiveEffect ae = entry.getValue();
+            org.bukkit.boss.BossBar bar = bars.get(kc);
+            if (bar == null) {
+                boolean negative = (kc == KcEffect.BLOATING);
+                bar = Bukkit.createBossBar(
+                        "§" + (negative ? "c" : "a") + "✦ " + kc.displayName(),
+                        negative ? org.bukkit.boss.BarColor.RED : org.bukkit.boss.BarColor.GREEN,
+                        org.bukkit.boss.BarStyle.SOLID);
+                bar.addPlayer(player);
+                bars.put(kc, bar);
+            }
+            long remainMs = Math.max(0, ae.expiry - now);
+            double progress = ae.totalTicks > 0
+                    ? (double) remainMs / (ae.totalTicks * 50L) : 0;
+            bar.setProgress(Math.max(0.0, Math.min(1.0, progress)));
+            int remainSec = (int) (remainMs / 1000);
+            String remain = formatDuration(remainSec * 20);
+            String level = ae.level > 0 ? " " + toRoman(ae.level + 1) : "";
+            boolean neg = (kc == KcEffect.BLOATING);
+            bar.setTitle("§" + (neg ? "c" : "a") + "✦ " + kc.displayName() + level
+                    + " ✦ §7" + remain);
+        }
+
+        // 移除过期条
+        for (Iterator<Map.Entry<KcEffect, org.bukkit.boss.BossBar>> it = bars.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<KcEffect, org.bukkit.boss.BossBar> entry = it.next();
+            if (!active.containsKey(entry.getKey())) {
+                entry.getValue().removePlayer(player);
+                entry.getValue().removeAll();
+                it.remove();
+            }
+        }
+        if (bars.isEmpty() && active.isEmpty()) bossBars.remove(uid);
     }
 
-    private Material getSmeltResult(Material ore) {
-        switch (ore) {
-            case IRON_ORE: case DEEPSLATE_IRON_ORE: return Material.IRON_INGOT;
-            case GOLD_ORE: case DEEPSLATE_GOLD_ORE: return Material.GOLD_INGOT;
-            case COPPER_ORE: case DEEPSLATE_COPPER_ORE: return Material.COPPER_INGOT;
-            case ANCIENT_DEBRIS: return Material.NETHERITE_SCRAP;
-            case SAND: return Material.GLASS;
-            default: return null;
+    private String toRoman(int n) {
+        switch (n) {
+            case 2: return "II";
+            case 3: return "III";
+            case 4: return "IV";
+            default: return "I";
         }
     }
 
-    // ===== 胀气：跳跃提升（氮气加速）=====
-    @EventHandler(priority = EventPriority.HIGH)
-    public void onMove(PlayerMoveEvent event) {
-        if (!effectManager.has(event.getPlayer(), KcEffect.BLOATING)) return;
-        if (event.getPlayer().isOnGround()) return;
-        if (event.getTo().getY() > event.getFrom().getY()) {
-            // 上升时略微增强
-            event.getPlayer().setVelocity(event.getPlayer().getVelocity().add(
-                    event.getPlayer().getVelocity().multiply(0.15)));
+    // ==================== 持久化 ====================
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        UUID uid = event.getPlayer().getUniqueId();
+        saveEffects(event.getPlayer());
+        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
+        if (bars != null) for (org.bukkit.boss.BossBar bar : bars.values()) bar.removeAll();
+        effectManager.remove(event.getPlayer());
+    }
+
+    @EventHandler
+    public void onDeath(org.bukkit.event.entity.PlayerDeathEvent event) {
+        Player player = event.getEntity();
+        UUID uid = player.getUniqueId();
+        Map<KcEffect, org.bukkit.boss.BossBar> bars = bossBars.remove(uid);
+        if (bars != null) for (org.bukkit.boss.BossBar bar : bars.values()) bar.removeAll();
+        effectManager.remove(player);
+        bloatingTriggered.remove(uid);
+    }
+
+    @EventHandler
+    public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) {
+        Map<String, Long> saved = loadEffects(event.getPlayer().getUniqueId());
+        if (saved != null && !saved.isEmpty()) {
+            effectManager.restore(event.getPlayer(), saved);
+            deleteEffects(event.getPlayer().getUniqueId());
         }
     }
 
-    // ===== CraftEngine 物品 ID 识别 =====
+    private File getDataFile(UUID uuid) {
+        File dir = new File(getDataFolder(), "effects");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, uuid + ".yml");
+    }
+
+    private void saveEffects(Player player) {
+        try {
+            Map<String, Long> snap = effectManager.snapshot(player);
+            if (snap.isEmpty()) { deleteEffects(player.getUniqueId()); return; }
+            File f = getDataFile(player.getUniqueId());
+            StringBuilder sb = new StringBuilder("# 下线暂存效果\n");
+            for (Map.Entry<String, Long> e : snap.entrySet())
+                sb.append(e.getKey()).append(": ").append(e.getValue()).append('\n');
+            Files.write(f.toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+        }
+    }
+
+    private Map<String, Long> loadEffects(UUID uuid) {
+        File f = getDataFile(uuid);
+        if (!f.exists()) return null;
+        try {
+            Map<String, Long> data = new LinkedHashMap<>();
+            for (String line : Files.readAllLines(f.toPath(), StandardCharsets.UTF_8)) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                String[] parts = trimmed.split(":", 2);
+                if (parts.length == 2) data.put(parts[0].trim(), Long.parseLong(parts[1].trim()));
+            }
+            return data;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void deleteEffects(UUID uuid) {
+        File f = getDataFile(uuid);
+        if (f.exists()) f.delete();
+    }
+
+    // ==================== 工具方法 ====================
+
+    /** Folia 兼容：在实体所属线程执行操作 */
+    private void scheduleEntity(Player player, java.util.function.Consumer<Player> action) {
+        if (player == null || !player.isOnline()) return;
+        try {
+            player.getScheduler().run(this, task -> {
+                if (player.isOnline()) action.accept(player);
+            }, null);
+        } catch (Throwable ignored) {
+            try { action.accept(player); } catch (Throwable ignored2) {}
+        }
+    }
+
+    /** CraftEngine 物品 ID 识别 */
     private String getItemId(ItemStack stack) {
         try {
             ItemManager im = CraftEngine.instance().itemManager();
             Item item = im.wrap(stack);
             Optional<Key> customId = item.customId();
-            if (customId.isPresent()) {
-                return customId.get().toString();
-            }
+            if (customId.isPresent()) return customId.get().toString();
         } catch (Throwable ignored) {
         }
         return null;

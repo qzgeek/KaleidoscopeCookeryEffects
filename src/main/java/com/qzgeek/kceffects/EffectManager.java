@@ -7,8 +7,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 效果状态管理：跟踪玩家当前生效的自定义效果及剩余时间
- * 记录总时长用于 BossBar 进度显示
+ * 效果状态管理：跟踪玩家当前生效的自定义效果及剩余时间。
  */
 public class EffectManager {
     public static class ActiveEffect {
@@ -26,9 +25,10 @@ public class EffectManager {
     /** player UUID -> (effect -> 效果状态) */
     private final Map<UUID, Map<KcEffect, ActiveEffect>> activeEffects = new ConcurrentHashMap<>();
 
+    /** 应用效果：同类覆盖（重置时长），不与原版药水叠加 */
     public void apply(Player player, KcEffect effect, int durationTicks, int level) {
-        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentHashMap<>());
-        // 与原版药水一致：同类效果直接覆盖（重置时长），不叠加
+        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(
+                player.getUniqueId(), k -> new ConcurrentHashMap<>());
         long newExpiry = System.currentTimeMillis() + durationTicks * 50L;
         map.put(effect, new ActiveEffect(newExpiry, durationTicks, level));
     }
@@ -60,6 +60,7 @@ public class EffectManager {
         activeEffects.remove(player.getUniqueId());
     }
 
+    /** 全局清理过期效果 */
     public void cleanup() {
         long now = System.currentTimeMillis();
         activeEffects.entrySet().removeIf(e -> {
@@ -68,15 +69,18 @@ public class EffectManager {
         });
     }
 
-    // ===== 持久化 =====
+    /** 扣除效果剩余 tick，返回 false 表示效果已消失 */
+    public boolean consumeTicks(Player player, KcEffect effect, long consumeTicks) {
+        return consumeMs(player, effect, consumeTicks * 50L);
+    }
 
-    /** 扣除效果剩余时间，返回 false 表示剩余时间不足、效果已消失 */
-    public boolean consumeTime(Player player, KcEffect effect, long consumeMillis) {
+    /** 扣除效果剩余毫秒，返回 false 表示效果已消失 */
+    public boolean consumeMs(Player player, KcEffect effect, long consumeMs) {
         Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
         if (map == null) return false;
         ActiveEffect ae = map.get(effect);
         if (ae == null) return false;
-        long newExpiry = ae.expiry - consumeMillis;
+        long newExpiry = ae.expiry - consumeMs;
         if (newExpiry <= System.currentTimeMillis()) {
             map.remove(effect);
             if (map.isEmpty()) activeEffects.remove(player.getUniqueId());
@@ -86,31 +90,33 @@ public class EffectManager {
         return true;
     }
 
-    /** 获取某玩家的可持久化效果数据（effect名 -> 剩余tick） */
-    public java.util.Map<String, Long> snapshot(Player player) {
-        java.util.Map<String, Long> snap = new java.util.LinkedHashMap<>();
+    // ---- 持久化 ----
+
+    /** 获取可持久化的效果快照（effect名 -> 剩余tick） */
+    public Map<String, Long> snapshot(Player player) {
+        Map<String, Long> snap = new java.util.LinkedHashMap<>();
         Map<KcEffect, ActiveEffect> map = activeEffects.get(player.getUniqueId());
         if (map == null) return snap;
         long now = System.currentTimeMillis();
         for (Map.Entry<KcEffect, ActiveEffect> entry : map.entrySet()) {
             long remainMs = entry.getValue().expiry - now;
-            if (remainMs > 0) {
-                snap.put(entry.getKey().name(), remainMs / 50L);
-            }
+            if (remainMs > 0) snap.put(entry.getKey().name(), remainMs / 50L);
         }
         return snap;
     }
 
     /** 从持久化数据恢复效果 */
-    public void restore(Player player, java.util.Map<String, Long> data) {
+    public void restore(Player player, Map<String, Long> data) {
         if (data == null || data.isEmpty()) return;
-        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentHashMap<>());
+        Map<KcEffect, ActiveEffect> map = activeEffects.computeIfAbsent(
+                player.getUniqueId(), k -> new ConcurrentHashMap<>());
         for (Map.Entry<String, Long> entry : data.entrySet()) {
             try {
                 KcEffect kc = KcEffect.valueOf(entry.getKey());
                 long remainTicks = entry.getValue();
                 if (remainTicks <= 0) continue;
-                map.put(kc, new ActiveEffect(System.currentTimeMillis() + remainTicks * 50L, remainTicks, 0));
+                map.put(kc, new ActiveEffect(
+                        System.currentTimeMillis() + remainTicks * 50L, remainTicks, 0));
             } catch (Exception ignored) {
             }
         }

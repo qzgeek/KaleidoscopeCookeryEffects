@@ -1,0 +1,6 @@
+build/
+jar/
+*.class
+*.jar
+!build.sh
+.DS_Store
