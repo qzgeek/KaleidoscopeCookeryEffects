@@ -8,7 +8,7 @@
 
 | 项目 | 版本 |
 |------|------|
-| 服务端类型 | **Folia** / **Lophine**（使用 EntityScheduler / GlobalRegionScheduler，Paper 未经测试） |
+| 服务端类型 | **Folia**（使用 EntityScheduler / GlobalRegionScheduler，Paper 未经测试） |
 | Minecraft | **1.21 ~ 最新版** |
 | CraftEngine | **26.7.4**（Community 版） |
 | KaleidoscopeCookeryPlugin | **1.1.2+** |
